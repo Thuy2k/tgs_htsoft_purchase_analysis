@@ -171,6 +171,7 @@ class TGS_HTSoft_Purchase_Analysis
         $user_id = get_current_user_id();
         $saved = 0;
         $skipped = 0;
+        $reset_missing = 0;
         $valid_rows = [];
 
         foreach ($raw_rows as $row) {
@@ -222,15 +223,26 @@ class TGS_HTSoft_Purchase_Analysis
             $valid_rows[] = $valid_row;
         }
 
+        if (!empty($valid_rows) && in_array($type, ['sales_week', 'sales_month'], true)) {
+            $reset_missing = $this->reset_sales_qty_for_missing_skus($table, $type, array_column($valid_rows, 'product_sku'), $user_id, $now);
+        }
+
         foreach (array_chunk($valid_rows, 500) as $chunk) {
             $this->bulk_upsert($table, $type, $chunk, $user_id, $now);
             $saved += count($chunk);
         }
 
+        $message = 'Da luu ' . number_format($saved) . ' ma hang';
+        if ($reset_missing > 0) {
+            $message .= ', reset ' . number_format($reset_missing) . ' ma khong co trong file ve 0';
+        }
+        $message .= $skipped ? ', bo qua ' . number_format($skipped) . ' dong.' : '.';
+
         wp_send_json_success([
-            'message' => 'Da luu ' . number_format($saved) . ' ma hang' . ($skipped ? ', bo qua ' . number_format($skipped) . ' dong.' : '.'),
+            'message' => $message,
             'saved' => $saved,
             'skipped' => $skipped,
+            'reset_missing' => $reset_missing,
         ]);
     }
 
@@ -361,6 +373,67 @@ class TGS_HTSoft_Purchase_Analysis
         if ($wpdb->last_error) {
             wp_send_json_error(['message' => 'Loi DB: ' . $wpdb->last_error], 500);
         }
+    }
+
+    private function reset_sales_qty_for_missing_skus($table, $type, array $imported_skus, $user_id, $now)
+    {
+        global $wpdb;
+
+        $column = '';
+        if ($type === 'sales_week') {
+            $column = 'week_sales_qty';
+        } elseif ($type === 'sales_month') {
+            $column = 'month_sales_qty';
+        }
+
+        if ($column === '') {
+            return 0;
+        }
+
+        $imported_map = [];
+        foreach ($imported_skus as $sku) {
+            $key = $this->normalize_sku($sku);
+            if ($key !== '') {
+                $imported_map[$key] = true;
+            }
+        }
+
+        if (empty($imported_map)) {
+            return 0;
+        }
+
+        $existing_skus = $wpdb->get_col("SELECT product_sku FROM {$table}");
+        if ($wpdb->last_error) {
+            wp_send_json_error(['message' => 'Loi DB: ' . $wpdb->last_error], 500);
+        }
+
+        $missing = [];
+        foreach ((array) $existing_skus as $sku) {
+            $key = $this->normalize_sku($sku);
+            if ($key !== '' && !isset($imported_map[$key])) {
+                $missing[$key] = $key;
+            }
+        }
+
+        if (empty($missing)) {
+            return 0;
+        }
+
+        foreach (array_chunk(array_values($missing), 500) as $chunk) {
+            $placeholders = implode(',', array_fill(0, count($chunk), '%s'));
+            $args = array_merge([(int) $user_id, $now], $chunk);
+            $sql = "UPDATE {$table}
+                    SET `{$column}` = 0,
+                        updated_by = %d,
+                        updated_at = %s
+                    WHERE UPPER(TRIM(product_sku)) IN ({$placeholders})";
+            $wpdb->query($wpdb->prepare($sql, ...$args));
+            if ($wpdb->last_error) {
+                wp_send_json_error(['message' => 'Loi DB: ' . $wpdb->last_error], 500);
+            }
+        }
+
+        return count($missing);
     }
 }
 
